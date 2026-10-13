@@ -1,3 +1,18 @@
 .venv/
 __pycache__/
 *.pyc
+.ipynb_checkpoints/
+
+# Downloaded datasets
+data/
+
+# Class activity checkpoints and old FashionCNN checkpoints
+checkpoints/
+checkpoints_fashion/
+
+# Keep only the final Assignment 2 checkpoint
+checkpoints_assignment2/*
+!checkpoints_assignment2/best_model.pth
+
+# Old FashionCNN test image
+fashion_test.png

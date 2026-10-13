@@ -17,9 +17,11 @@ COPY pyproject.toml uv.lock README.md .python-version /code/
 COPY src /code/src
 COPY app /code/app
 COPY main.py /code/main.py
+COPY helper_lib /code/helper_lib
+COPY checkpoints_assignment2/best_model.pth /code/checkpoints_assignment2/best_model.pth
 
 RUN uv sync --frozen
 
 EXPOSE 80
 
-CMD ["uv", "run", "fastapi", "run", "main.py", "--host", "0.0.0.0", "--port", "80"]
+CMD ["/code/.venv/bin/fastapi", "run", "main.py", "--host", "0.0.0.0", "--port", "80"]

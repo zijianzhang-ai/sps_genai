@@ -1,5 +1,9 @@
 .venv/
 .git/
-__pycache__/
+**/__pycache__/
 *.pyc
 .ipynb_checkpoints/
+data/
+checkpoints/
+checkpoints_fashion/
+checkpoints_assignment2/model_epoch_*.pth
