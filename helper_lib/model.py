@@ -1,6 +1,622 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+import copy
+
+def linear_diffusion_schedule(
+    diffusion_times,
+    min_rate=1e-4,
+    max_rate=0.02
+):
+    diffusion_times = diffusion_times.to(
+        dtype=torch.float32
+    )
+
+    betas = (
+        min_rate
+        + diffusion_times * (max_rate - min_rate)
+    )
+
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+
+    signal_rates = torch.sqrt(alpha_bars)
+    noise_rates = torch.sqrt(1.0 - alpha_bars)
+
+    return noise_rates, signal_rates
+
+
+def cosine_diffusion_schedule(diffusion_times):
+    signal_rates = torch.cos(
+        diffusion_times * math.pi / 2
+    )
+
+    noise_rates = torch.sin(
+        diffusion_times * math.pi / 2
+    )
+
+    return noise_rates, signal_rates
+
+
+def offset_cosine_diffusion_schedule(
+    diffusion_times,
+    min_signal_rate=0.02,
+    max_signal_rate=0.95
+):
+    original_shape = diffusion_times.shape
+    diffusion_times_flat = diffusion_times.flatten()
+
+    start_angle = torch.acos(
+        torch.tensor(
+            max_signal_rate,
+            dtype=torch.float32,
+            device=diffusion_times.device
+        )
+    )
+
+    end_angle = torch.acos(
+        torch.tensor(
+            min_signal_rate,
+            dtype=torch.float32,
+            device=diffusion_times.device
+        )
+    )
+
+    diffusion_angles = (
+        start_angle
+        + diffusion_times_flat
+        * (end_angle - start_angle)
+    )
+
+    signal_rates = torch.cos(
+        diffusion_angles
+    ).reshape(original_shape)
+
+    noise_rates = torch.sin(
+        diffusion_angles
+    ).reshape(original_shape)
+
+    return noise_rates, signal_rates
+
+class SinusoidalEmbedding(nn.Module):
+    def __init__(self, num_frequencies=16):
+        super().__init__()
+
+        self.num_frequencies = num_frequencies
+
+        frequencies = torch.exp(
+            torch.linspace(
+                math.log(1.0),
+                math.log(1000.0),
+                num_frequencies
+            )
+        )
+
+        self.register_buffer(
+            "angular_speeds",
+            2.0
+            * math.pi
+            * frequencies.view(1, 1, 1, -1)
+        )
+
+    def forward(self, x):
+        """
+        x: Tensor of shape (B, 1, 1, 1)
+
+        returns:
+        Tensor of shape
+        (B, 1, 1, 2 * num_frequencies)
+        """
+        x = x.expand(
+            -1,
+            1,
+            1,
+            self.num_frequencies
+        )
+
+        sin_part = torch.sin(
+            self.angular_speeds * x
+        )
+
+        cos_part = torch.cos(
+            self.angular_speeds * x
+        )
+
+        return torch.cat(
+            [sin_part, cos_part],
+            dim=-1
+        )
+
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.needs_projection = (
+            in_channels != out_channels
+        )
+
+        if self.needs_projection:
+            self.proj = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=1
+            )
+        else:
+            self.proj = nn.Identity()
+
+        self.norm = nn.BatchNorm2d(
+            in_channels,
+            affine=False
+        )
+
+        self.conv1 = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1
+        )
+
+        self.conv2 = nn.Conv2d(
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            padding=1
+        )
+
+    def swish(self, x):
+        return x * torch.sigmoid(x)
+
+    def forward(self, x):
+        residual = self.proj(x)
+
+        x = self.swish(
+            self.conv1(x)
+        )
+
+        x = self.conv2(x)
+
+        return x + residual
+
+
+class DownBlock(nn.Module):
+    def __init__(
+        self,
+        width,
+        block_depth,
+        in_channels
+    ):
+        super().__init__()
+
+        self.blocks = nn.ModuleList()
+
+        for _ in range(block_depth):
+            self.blocks.append(
+                ResidualBlock(
+                    in_channels,
+                    width
+                )
+            )
+
+            in_channels = width
+
+        self.pool = nn.AvgPool2d(
+            kernel_size=2
+        )
+
+    def forward(self, x, skips):
+        for block in self.blocks:
+            x = block(x)
+            skips.append(x)
+
+        x = self.pool(x)
+
+        return x
+
+
+class UpBlock(nn.Module):
+    def __init__(
+        self,
+        width,
+        block_depth,
+        in_channels
+    ):
+        super().__init__()
+
+        self.blocks = nn.ModuleList()
+
+        for _ in range(block_depth):
+            self.blocks.append(
+                ResidualBlock(
+                    in_channels + width,
+                    width
+                )
+            )
+
+            in_channels = width
+
+    def forward(self, x, skips):
+        x = F.interpolate(
+            x,
+            scale_factor=2,
+            mode="bilinear",
+            align_corners=False
+        )
+
+        for block in self.blocks:
+            skip = skips.pop()
+
+            x = torch.cat(
+                [x, skip],
+                dim=1
+            )
+
+            x = block(x)
+
+        return x
+
+class UNet(nn.Module):
+    def __init__(
+        self,
+        image_size,
+        num_channels,
+        embedding_dim=32
+    ):
+        super().__init__()
+
+        self.initial = nn.Conv2d(
+            num_channels,
+            32,
+            kernel_size=1
+        )
+
+        self.num_channels = num_channels
+        self.image_size = image_size
+        self.embedding_dim = embedding_dim
+
+        self.embedding = SinusoidalEmbedding(
+            num_frequencies=16
+        )
+
+        self.embedding_proj = nn.Conv2d(
+            embedding_dim,
+            32,
+            kernel_size=1
+        )
+
+        self.down1 = DownBlock(
+            32,
+            in_channels=64,
+            block_depth=2
+        )
+
+        self.down2 = DownBlock(
+            64,
+            in_channels=32,
+            block_depth=2
+        )
+
+        self.down3 = DownBlock(
+            96,
+            in_channels=64,
+            block_depth=2
+        )
+
+        self.mid1 = ResidualBlock(
+            in_channels=96,
+            out_channels=128
+        )
+
+        self.mid2 = ResidualBlock(
+            in_channels=128,
+            out_channels=128
+        )
+
+        self.up1 = UpBlock(
+            96,
+            in_channels=128,
+            block_depth=2
+        )
+
+        self.up2 = UpBlock(
+            64,
+            block_depth=2,
+            in_channels=96
+        )
+
+        self.up3 = UpBlock(
+            32,
+            block_depth=2,
+            in_channels=64
+        )
+
+        self.final = nn.Conv2d(
+            32,
+            num_channels,
+            kernel_size=1
+        )
+
+        nn.init.zeros_(self.final.weight)
+
+    def forward(
+        self,
+        noisy_images,
+        noise_variances
+    ):
+        skips = []
+
+        x = self.initial(noisy_images)
+
+        noise_emb = self.embedding(
+            noise_variances
+        )
+
+        noise_emb = F.interpolate(
+            noise_emb.permute(0, 3, 1, 2),
+            size=(
+                self.image_size,
+                self.image_size
+            ),
+            mode="nearest"
+        )
+
+        x = torch.cat(
+            [x, noise_emb],
+            dim=1
+        )
+
+        x = self.down1(x, skips)
+        x = self.down2(x, skips)
+        x = self.down3(x, skips)
+
+        x = self.mid1(x)
+        x = self.mid2(x)
+
+        x = self.up1(x, skips)
+        x = self.up2(x, skips)
+        x = self.up3(x, skips)
+
+        return self.final(x)
+
+class DiffusionModel(nn.Module):
+    def __init__(self, model, schedule_fn):
+        super().__init__()
+
+        self.network = model
+        self.ema_network = copy.deepcopy(model)
+        self.ema_network.eval()
+
+        self.ema_decay = 0.8
+        self.schedule_fn = schedule_fn
+
+        self.normalizer_mean = 0.0
+        self.normalizer_std = 1.0
+
+    def to(self, device):
+        super().to(device)
+        self.ema_network.to(device)
+
+        return self
+
+    def set_normalizer(self, mean, std):
+        self.normalizer_mean = mean
+        self.normalizer_std = std
+
+    def denormalize(self, x):
+        return torch.clamp(
+            x * self.normalizer_std
+            + self.normalizer_mean,
+            0.0,
+            1.0
+        )
+
+    def denoise(
+        self,
+        noisy_images,
+        noise_rates,
+        signal_rates,
+        training
+    ):
+        if training:
+            network = self.network
+            network.train()
+        else:
+            network = self.ema_network
+            network.eval()
+
+        pred_noises = network(
+            noisy_images,
+            noise_rates ** 2
+        )
+
+        pred_images = (
+            noisy_images
+            - noise_rates * pred_noises
+        ) / signal_rates
+
+        return pred_noises, pred_images
+
+    def reverse_diffusion(
+        self,
+        initial_noise,
+        diffusion_steps
+    ):
+        step_size = 1.0 / diffusion_steps
+        current_images = initial_noise
+
+        for step in range(diffusion_steps):
+            diffusion_times = torch.ones(
+                (
+                    initial_noise.shape[0],
+                    1,
+                    1,
+                    1
+                ),
+                device=initial_noise.device
+            ) * (
+                1 - step * step_size
+            )
+
+            noise_rates, signal_rates = (
+                self.schedule_fn(
+                    diffusion_times
+                )
+            )
+
+            pred_noises, pred_images = (
+                self.denoise(
+                    current_images,
+                    noise_rates,
+                    signal_rates,
+                    training=False
+                )
+            )
+
+            next_diffusion_times = (
+                diffusion_times - step_size
+            )
+
+            (
+                next_noise_rates,
+                next_signal_rates
+            ) = self.schedule_fn(
+                next_diffusion_times
+            )
+
+            current_images = (
+                next_signal_rates
+                * pred_images
+                + next_noise_rates
+                * pred_noises
+            )
+
+        return pred_images
+
+    def generate(
+        self,
+        num_images,
+        diffusion_steps,
+        image_size=64,
+        initial_noise=None
+    ):
+        if initial_noise is None:
+            initial_noise = torch.randn(
+                (
+                    num_images,
+                    self.network.num_channels,
+                    image_size,
+                    image_size
+                ),
+                device=next(
+                    self.parameters()
+                ).device
+            )
+
+        with torch.no_grad():
+            return self.denormalize(
+                self.reverse_diffusion(
+                    initial_noise,
+                    diffusion_steps
+                )
+            )
+
+    def train_step(
+        self,
+        images,
+        optimizer,
+        loss_fn
+    ):
+        images = (
+            images - self.normalizer_mean
+        ) / self.normalizer_std
+
+        noises = torch.randn_like(images)
+
+        diffusion_times = torch.rand(
+            (
+                images.size(0),
+                1,
+                1,
+                1
+            ),
+            device=images.device
+        )
+
+        noise_rates, signal_rates = (
+            self.schedule_fn(
+                diffusion_times
+            )
+        )
+
+        noisy_images = (
+            signal_rates * images
+            + noise_rates * noises
+        )
+
+        pred_noises, _ = self.denoise(
+            noisy_images,
+            noise_rates,
+            signal_rates,
+            training=True
+        )
+
+        loss = loss_fn(
+            pred_noises,
+            noises
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        return loss.item()
+
+    def test_step(
+        self,
+        images,
+        loss_fn
+    ):
+        images = (
+            images - self.normalizer_mean
+        ) / self.normalizer_std
+
+        noises = torch.randn_like(images)
+
+        diffusion_times = torch.rand(
+            (
+                images.size(0),
+                1,
+                1,
+                1
+            ),
+            device=images.device
+        )
+
+        noise_rates, signal_rates = (
+            self.schedule_fn(
+                diffusion_times
+            )
+        )
+
+        noisy_images = (
+            signal_rates * images
+            + noise_rates * noises
+        )
+
+        with torch.no_grad():
+            pred_noises, _ = self.denoise(
+                noisy_images,
+                noise_rates,
+                signal_rates,
+                training=False
+            )
+
+            loss = loss_fn(
+                pred_noises,
+                noises
+            )
+
+        return loss.item()
 
 # From Practical 1
 class MLP(nn.Module):
@@ -136,6 +752,211 @@ class VAE(nn.Module):
         reconstruction = self.decoder(z)
         return reconstruction, mu, logvar
 
+
+# Module 6 Class Activity: GAN
+class Critic(nn.Module):
+    def __init__(self):
+        super(Critic, self).__init__()
+
+        self.conv1 = nn.Conv2d(
+            3, 64, kernel_size=4, stride=2, padding=1, bias=False
+        )
+        self.batchnorm1 = nn.BatchNorm2d(64)
+        self.act1 = nn.LeakyReLU(0.2, inplace=True)
+
+        self.conv2 = nn.Conv2d(
+            64, 128, kernel_size=4, stride=2, padding=1, bias=False
+        )
+        self.batchnorm2 = nn.BatchNorm2d(128)
+        self.act2 = nn.LeakyReLU(0.2, inplace=True)
+
+        self.conv3 = nn.Conv2d(
+            128, 256, kernel_size=4, stride=2, padding=1, bias=False
+        )
+        self.batchnorm3 = nn.BatchNorm2d(256)
+        self.act3 = nn.LeakyReLU(0.2, inplace=True)
+
+        self.conv4 = nn.Conv2d(
+            256, 512, kernel_size=4, stride=2, padding=1, bias=False
+        )
+        self.batchnorm4 = nn.BatchNorm2d(512)
+        self.act4 = nn.LeakyReLU(0.2, inplace=True)
+
+        self.conv5 = nn.Conv2d(
+            512, 1, kernel_size=4, stride=1, padding=0, bias=False
+        )
+        self.flatten = nn.Flatten()
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.batchnorm1(x)
+        x = self.act1(x)
+
+        x = self.conv2(x)
+        x = self.batchnorm2(x)
+        x = self.act2(x)
+
+        x = self.conv3(x)
+        x = self.batchnorm3(x)
+        x = self.act3(x)
+
+        x = self.conv4(x)
+        x = self.batchnorm4(x)
+        x = self.act4(x)
+
+        x = self.conv5(x)
+        x = self.flatten(x)
+
+        return x
+
+class Generator(nn.Module):
+    def __init__(self, z_dim):
+        super(Generator, self).__init__()
+        self.z_dim = z_dim
+
+        self.reshape = lambda x: x.view(x.size(0), z_dim, 1, 1)
+
+        self.deconv1 = nn.ConvTranspose2d(z_dim, 512, kernel_size=4, stride=1, padding=0, bias=False)
+        self.bn1 = nn.BatchNorm2d(512, momentum=0.9)
+        self.act1 = nn.ReLU(True) # nn.LeakyReLU(0.2, inplace=True)
+
+        self.deconv2 = nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(256, momentum=0.9)
+        self.act2 = nn.ReLU(True) # nn.LeakyReLU(0.2, inplace=True)
+
+        self.deconv3 = nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(128, momentum=0.9)
+        self.act3 = nn.ReLU(True) # nn.LeakyReLU(0.2, inplace=True)
+
+        self.deconv4 = nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False)
+        self.bn4 = nn.BatchNorm2d(64, momentum=0.9)
+        self.act4 = nn.ReLU(True) # nn.LeakyReLU(0.2, inplace=True)
+
+        self.deconv5 = nn.ConvTranspose2d(64, 3, kernel_size=4, stride=2, padding=1)
+        self.tanh = nn.Tanh()
+
+    def forward(self, x):
+        x = self.reshape(x)
+
+        x = self.deconv1(x)
+        x = self.bn1(x)
+        x = self.act1(x)
+
+        x = self.deconv2(x)
+        x = self.bn2(x)
+        x = self.act2(x)
+
+        x = self.deconv3(x)
+        x = self.bn3(x)
+        x = self.act3(x)
+
+        x = self.deconv4(x)
+        x = self.bn4(x)
+        x = self.act4(x)
+
+        x = self.deconv5(x)
+        x = self.tanh(x)
+
+        return x
+
+# Assignment 3: GAN
+class Assignment3Generator(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.fc = nn.Linear(
+            100,
+            7 * 7 * 128
+        )
+
+        self.convtrans1 = nn.ConvTranspose2d(
+            128,
+            64,
+            kernel_size=4,
+            stride=2,
+            padding=1
+        )
+
+        self.batchnorm1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU()
+
+        self.convtrans2 = nn.ConvTranspose2d(
+            64,
+            1,
+            kernel_size=4,
+            stride=2,
+            padding=1
+        )
+
+        self.tanh = nn.Tanh()
+
+    def forward(self, x):
+        x = self.fc(x)
+
+        x = x.view(
+            -1,
+            128,
+            7,
+            7
+        )
+
+        x = self.convtrans1(x)
+        x = self.batchnorm1(x)
+        x = self.relu(x)
+
+        x = self.convtrans2(x)
+        x = self.tanh(x)
+
+        return x
+
+class Assignment3Discriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(
+            1,
+            64,
+            kernel_size=4,
+            stride=2,
+            padding=1
+        )
+
+        self.leakyrelu1 = nn.LeakyReLU(0.2)
+
+        self.conv2 = nn.Conv2d(
+            64,
+            128,
+            kernel_size=4,
+            stride=2,
+            padding=1
+        )
+
+        self.batchnorm2 = nn.BatchNorm2d(128)
+        self.leakyrelu2 = nn.LeakyReLU(0.2)
+
+        self.flatten = nn.Flatten()
+
+        self.fc = nn.Linear(
+            128 * 7 * 7,
+            1
+        )
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.leakyrelu1(x)
+
+        x = self.conv2(x)
+        x = self.batchnorm2(x)
+        x = self.leakyrelu2(x)
+
+        x = self.flatten(x)
+        x = self.fc(x)
+        x = self.sigmoid(x)
+
+        return x
+
 # Assignment 2
 class AssignmentCNN(nn.Module):
     def __init__(self):
@@ -174,6 +995,24 @@ def get_model(model_name):
         model = EnhancedCNN()
     elif model_name == "VAE":
         model = VAE(VariationalEncoder(), Decoder())
+    elif model_name == "GAN":
+        model = (Generator(100), Critic())
+    elif model_name == "Assignment3GAN":
+        model = (
+            Assignment3Generator(),
+            Assignment3Discriminator()
+        )
+    elif model_name == "Diffusion":
+        unet = UNet(
+            image_size=64,
+            num_channels=3,
+            embedding_dim=64
+        )
+        
+        model = DiffusionModel(
+            unet,
+            offset_cosine_diffusion_schedule
+        )
     elif model_name == "AssignmentCNN":
         model = AssignmentCNN()
     else:

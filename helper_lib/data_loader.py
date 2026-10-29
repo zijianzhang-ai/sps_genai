@@ -64,3 +64,32 @@ def get_assignment_data_loader(data_dir, batch_size=32, train=True):
     )
 
     return loader
+
+def get_assignment3_data_loader(
+    data_dir,
+    batch_size=64,
+    train=True
+):
+    # Match MNIST images to the Generator's Tanh output range.
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=(0.5,),
+            std=(0.5,)
+        )
+    ])
+
+    dataset = datasets.MNIST(
+        root=data_dir,
+        train=train,
+        download=True,
+        transform=transform
+    )
+
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=train
+    )
+
+    return loader

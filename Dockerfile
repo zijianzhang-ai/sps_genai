@@ -19,6 +19,8 @@ COPY app /code/app
 COPY main.py /code/main.py
 COPY helper_lib /code/helper_lib
 COPY checkpoints_assignment2/best_model.pth /code/checkpoints_assignment2/best_model.pth
+COPY checkpoints_rnn/rnn_model.pth /code/checkpoints_rnn/rnn_model.pth
+COPY checkpoints_assignment3/assignment3_gan.pth /code/checkpoints_assignment3/assignment3_gan.pth
 
 RUN uv sync --frozen
 

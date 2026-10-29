@@ -144,3 +144,222 @@ def vae_loss_function(recon_x, x, mu, logvar):
     )
 
     return beta * BCE + KLD
+
+def train_gan(
+    model,
+    data_loader,
+    criterion,
+    optimizer,
+    device="cpu",
+    epochs=10
+):
+    gen, critic = model
+    opt_gen, opt_critic = optimizer
+
+    gen = gen.to(device)
+    critic = critic.to(device)
+
+    gen.train()
+    critic.train()
+
+    z_dim = 100
+    n_critic = 5
+    clip_value = 0.01
+
+    for epoch in range(epochs):
+        train_loader_with_progress = tqdm(
+            iterable=data_loader,
+            ncols=120,
+            desc=f"Epoch {epoch + 1}/{epochs}"
+        )
+
+        for batch_number, (real, _) in enumerate(
+            train_loader_with_progress
+        ):
+            real = real.to(device)
+            batch_size = real.size(0)
+
+            # === Train Critic ===
+            for _ in range(n_critic):
+                noise = torch.randn(
+                    batch_size, z_dim, 1, 1
+                ).to(device)
+
+                fake = gen(noise).detach()
+
+                critic_real = critic(real).mean()
+                critic_fake = critic(fake).mean()
+
+                loss_critic = -(critic_real - critic_fake)
+
+                critic.zero_grad()
+                loss_critic.backward()
+                opt_critic.step()
+
+                # Weight clipping
+                for p in critic.parameters():
+                    p.data.clamp_(-clip_value, clip_value)
+
+            # === Train Generator ===
+            noise = torch.randn(
+                batch_size, z_dim, 1, 1
+            ).to(device)
+
+            fake = gen(noise)
+            loss_gen = -critic(fake).mean()
+
+            gen.zero_grad()
+            loss_gen.backward()
+            opt_gen.step()
+
+            if batch_number % 100 == 0:
+                train_loader_with_progress.set_postfix(
+                    {
+                        "Batch": (
+                            f"{batch_number}/{len(data_loader)}"
+                        ),
+                        "D loss": f"{loss_critic.item():.4f}",
+                        "G loss": f"{loss_gen.item():.4f}",
+                    }
+                )
+
+    return model
+
+def train_assignment3_gan(
+    model,
+    data_loader,
+    criterion,
+    optimizer,
+    device="cpu",
+    epochs=10
+):
+    generator, discriminator = model
+    optimizer_generator, optimizer_discriminator = optimizer
+
+    generator = generator.to(device)
+    discriminator = discriminator.to(device)
+
+    generator.train()
+    discriminator.train()
+
+    z_dim = 100
+
+    for epoch in range(epochs):
+        progress = tqdm(
+            iterable=data_loader,
+            ncols=120,
+            desc=f"Epoch {epoch + 1}/{epochs}"
+        )
+
+        for real_images, _ in progress:
+            real_images = real_images.to(device)
+            batch_size = real_images.size(0)
+
+            real_labels = torch.ones(
+                batch_size,
+                1,
+                device=device
+            )
+
+            fake_labels = torch.zeros(
+                batch_size,
+                1,
+                device=device
+            )
+
+            # Train Discriminator
+            optimizer_discriminator.zero_grad()
+
+            real_predictions = discriminator(
+                real_images
+            )
+
+            real_loss = criterion(
+                real_predictions,
+                real_labels
+            )
+
+            noise = torch.randn(
+                batch_size,
+                z_dim,
+                device=device
+            )
+
+            fake_images = generator(noise)
+
+            fake_predictions = discriminator(
+                fake_images.detach()
+            )
+
+            fake_loss = criterion(
+                fake_predictions,
+                fake_labels
+            )
+
+            discriminator_loss = (
+                real_loss + fake_loss
+            ) / 2
+
+            discriminator_loss.backward()
+            optimizer_discriminator.step()
+
+            # Train Generator
+            optimizer_generator.zero_grad()
+
+            generated_predictions = discriminator(
+                fake_images
+            )
+
+            generator_loss = criterion(
+                generated_predictions,
+                real_labels
+            )
+
+            generator_loss.backward()
+            optimizer_generator.step()
+
+            progress.set_postfix(
+                {
+                    "D loss": (
+                        f"{discriminator_loss.item():.4f}"
+                    ),
+                    "G loss": (
+                        f"{generator_loss.item():.4f}"
+                    )
+                }
+            )
+
+    return model
+    
+def train_diffusion(
+    model,
+    data_loader,
+    criterion,
+    optimizer,
+    device="cpu",
+    epochs=10
+):
+    model = model.to(device)
+    model.train()
+
+    for epoch in range(epochs):
+        train_loader_with_progress = tqdm(
+            iterable=data_loader,
+            ncols=120,
+            desc=f"Epoch {epoch + 1}/{epochs}"
+        )
+
+        for images, _ in train_loader_with_progress:
+            images = images.to(device)
+
+            loss = model.train_step(
+                images,
+                optimizer,
+                criterion
+            )
+
+            train_loader_with_progress.set_postfix(
+                loss=f"{loss:.4f}"
+            )
+
+    return model   
