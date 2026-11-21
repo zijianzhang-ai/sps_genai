@@ -569,6 +569,25 @@ class DiffusionModel(nn.Module):
         loss.backward()
         optimizer.step()
 
+        # Update the EMA network used for image generation.
+        with torch.no_grad():
+            for ema_parameter, parameter in zip(
+                self.ema_network.parameters(),
+                self.network.parameters()
+            ):
+                ema_parameter.mul_(self.ema_decay)
+                ema_parameter.add_(
+                    parameter,
+                    alpha=1.0 - self.ema_decay
+                )
+
+            # Keep non-parameter state synchronized as well.
+            for ema_buffer, buffer in zip(
+                self.ema_network.buffers(),
+                self.network.buffers()
+            ):
+                ema_buffer.copy_(buffer)
+
         return loss.item()
 
     def test_step(

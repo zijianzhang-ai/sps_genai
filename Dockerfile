@@ -1,15 +1,6 @@
 FROM python:3.13-slim-bookworm
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-ADD https://astral.sh/uv/install.sh /uv-installer.sh
-
-RUN sh /uv-installer.sh \
-    && rm /uv-installer.sh
-
-ENV PATH="/root/.local/bin:$PATH"
+COPY --from=ghcr.io/astral-sh/uv:0.13.9 /uv /uvx /bin/
 
 WORKDIR /code
 
@@ -23,6 +14,9 @@ COPY checkpoints_rnn/rnn_model.pth /code/checkpoints_rnn/rnn_model.pth
 COPY checkpoints_assignment3/assignment3_gan.pth /code/checkpoints_assignment3/assignment3_gan.pth
 
 RUN uv sync --frozen
+COPY checkpoints_llm /code/checkpoints_llm
+COPY checkpoints_assignment4_diffusion/diffusion_best.pth /code/checkpoints_assignment4_diffusion/diffusion_best.pth
+COPY checkpoints_assignment4_ebm/ebm_latest.pth /code/checkpoints_assignment4_ebm/ebm_latest.pth
 
 EXPOSE 80
 

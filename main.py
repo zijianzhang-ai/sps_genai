@@ -9,8 +9,11 @@ import torch
 from PIL import Image, UnidentifiedImageError
 from torchvision import transforms
 from helper_lib.model import get_model
-from app.rnn_model import (LSTMModel, generate_text as generate_rnn_text)
+from app.rnn_model import LSTMModel, generate_text as generate_rnn_text
 from torchvision.utils import make_grid
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from helper_lib.model import UNet, DiffusionModel, offset_cosine_diffusion_schedule
+from helper_lib.energy_model import EnergyModel, generate_samples as generate_ebm_samples
 
 app = FastAPI()
 
@@ -209,4 +212,213 @@ def generate_mnist(num_images: int = 16):
     return StreamingResponse(
         image_buffer,
         media_type="image/png"
+    )
+
+# Module 9: load the fine-tuned GPT-2 model and tokenizer.
+llm_checkpoint_path = (
+    Path(__file__).resolve().parent
+    / "checkpoints_llm"
+)
+
+llm_tokenizer = AutoTokenizer.from_pretrained(
+    llm_checkpoint_path
+)
+
+llm_model = AutoModelForCausalLM.from_pretrained(
+    llm_checkpoint_path
+).to("cpu")
+
+llm_model.eval()
+
+
+@app.post("/generate_with_llm")
+def generate_with_llm(request: TextGenerationRequest):
+    if not request.start_word.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="start_word must not be empty."
+        )
+
+    if request.length < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="length must be at least 1."
+        )
+
+    inputs = llm_tokenizer(
+        request.start_word,
+        return_tensors="pt"
+    )
+
+    input_length = inputs["input_ids"].shape[1]
+
+    if input_length + request.length > llm_model.config.n_positions:
+        raise HTTPException(
+            status_code=400,
+            detail="The prompt and requested output exceed the model's context limit."
+        )
+
+    with torch.no_grad():
+        output_ids = llm_model.generate(
+            **inputs,
+            max_new_tokens=request.length,
+            do_sample=False,
+            pad_token_id=llm_tokenizer.pad_token_id,
+            eos_token_id=llm_tokenizer.eos_token_id
+        )
+
+    generated_text = llm_tokenizer.decode(
+        output_ids[0, input_length:],
+        skip_special_tokens=True
+    )
+
+    return {"generated_text": generated_text}
+
+# Assignment 4: load the best trained diffusion model.
+diffusion_checkpoint_path = (
+    Path(__file__).resolve().parent
+    / "checkpoints_assignment4_diffusion"
+    / "diffusion_best.pth"
+)
+
+diffusion_checkpoint = torch.load(
+    diffusion_checkpoint_path,
+    map_location="cpu",
+)
+
+diffusion_network = UNet(
+    image_size=64,
+    num_channels=3,
+    embedding_dim=32,
+)
+
+diffusion_model = DiffusionModel(
+    diffusion_network,
+    offset_cosine_diffusion_schedule,
+).to("cpu")
+
+diffusion_model.network.load_state_dict(
+    diffusion_checkpoint["model_state_dict"]
+)
+diffusion_model.ema_network.load_state_dict(
+    diffusion_checkpoint["ema_model_state_dict"]
+)
+diffusion_model.set_normalizer(
+    diffusion_checkpoint["normalizer_mean"],
+    diffusion_checkpoint["normalizer_std"],
+)
+diffusion_model.eval()
+
+
+@app.get("/generate_with_diffusion")
+def generate_with_diffusion(
+    num_images: int = 4,
+    diffusion_steps: int = 20,
+):
+    if not 1 <= num_images <= 16:
+        raise HTTPException(
+            status_code=400,
+            detail="num_images must be between 1 and 16.",
+        )
+
+    if not 1 <= diffusion_steps <= 100:
+        raise HTTPException(
+            status_code=400,
+            detail="diffusion_steps must be between 1 and 100.",
+        )
+
+    with torch.no_grad():
+        generated_images = diffusion_model.generate(
+            num_images=num_images,
+            diffusion_steps=diffusion_steps,
+            image_size=64,
+        )
+
+    grid = make_grid(
+        generated_images.cpu(),
+        nrow=min(num_images, 4),
+    )
+    output_image = transforms.ToPILImage()(grid)
+
+    image_buffer = io.BytesIO()
+    output_image.save(image_buffer, format="PNG")
+    image_buffer.seek(0)
+
+    return StreamingResponse(
+        image_buffer,
+        media_type="image/png",
+    )
+
+# Assignment 4: load the trained energy model.
+ebm_checkpoint_path = (
+    Path(__file__).resolve().parent
+    / "checkpoints_assignment4_ebm"
+    / "ebm_latest.pth"
+)
+
+ebm_checkpoint = torch.load(
+    ebm_checkpoint_path,
+    map_location="cpu",
+)
+
+ebm_model = EnergyModel().to("cpu")
+ebm_model.load_state_dict(
+    ebm_checkpoint["model_state_dict"]
+)
+ebm_model.eval()
+
+# Sampling needs image gradients, but not parameter gradients.
+for parameter in ebm_model.parameters():
+    parameter.requires_grad_(False)
+
+# Release the training buffer and optimizer state from API memory.
+del ebm_checkpoint
+
+
+@app.get("/generate_with_ebm")
+def generate_with_ebm(
+    num_images: int = 4,
+    steps: int = 256,
+):
+    if not 1 <= num_images <= 16:
+        raise HTTPException(
+            status_code=400,
+            detail="num_images must be between 1 and 16.",
+        )
+
+    if not 1 <= steps <= 1024:
+        raise HTTPException(
+            status_code=400,
+            detail="steps must be between 1 and 1024.",
+        )
+
+    initial_images = torch.rand(
+        num_images, 3, 32, 32
+    ) * 2 - 1
+
+    # EBM generation requires gradients with respect to pixels.
+    with torch.enable_grad():
+        samples = generate_ebm_samples(
+            nn_energy_model=ebm_model,
+            inp_imgs=initial_images,
+            steps=steps,
+            step_size=10.0,
+            noise_std=0.01,
+        )
+
+    images = ((samples + 1) / 2).clamp(0, 1)
+
+    grid = make_grid(
+        images.cpu(),
+        nrow=min(num_images, 4),
+    )
+    output_image = transforms.ToPILImage()(grid)
+
+    image_buffer = io.BytesIO()
+    output_image.save(image_buffer, format="PNG")
+    image_buffer.seek(0)
+
+    return StreamingResponse(
+        image_buffer,
+        media_type="image/png",
     )

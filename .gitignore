@@ -16,3 +16,20 @@ checkpoints_assignment2/*
 
 # Old FashionCNN test image
 fashion_test.png
+
+# Local experiments, checks, and generated images
+__marimo__/
+Module_10_Practical_ReinforcementLearning.py
+assignment3_generated_images.png
+check_ebm_buffer.py
+test_assignment4.py
+test_assignment4_ebm.py
+outputs_assignment4/
+ebm_latest.pth
+
+# Keep only the checkpoints used by the API
+checkpoints_assignment4_diffusion/*
+!checkpoints_assignment4_diffusion/diffusion_best.pth
+
+checkpoints_assignment4_ebm/*
+!checkpoints_assignment4_ebm/ebm_latest.pth
